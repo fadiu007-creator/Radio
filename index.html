@@ -13,7 +13,6 @@
     --display: "Unbounded", "Arial Black", sans-serif;
     --body: "Instrument Sans", system-ui, sans-serif;
   }
-  /* Colours follow the time of day, matching the playlist schedule */
   [data-daypart="day"]  { --bg:#ffd9a0; --ink:#2a1236; --accent:#e5336d; --muted:rgba(42,18,54,.65); }
   [data-daypart="peak"] { --bg:#2a0e4a; --ink:#fff1e0; --accent:#ff3d8b; --muted:rgba(255,241,224,.62); }
   [data-daypart="late"] { --bg:#08172e; --ink:#dde9ff; --accent:#35e0c2; --muted:rgba(221,233,255,.62); }
@@ -27,7 +26,7 @@
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     min-height: 100%; gap: 2.2rem; text-align: center; padding-inline: 1.25rem;
   }
-  .station { font-family: var(--display); font-weight: 800; font-size: clamp(1.1rem, 4vw, 1.6rem); letter-spacing: .01em; }
+  .station { font-family: var(--display); font-weight: 800; font-size: clamp(1.1rem, 4vw, 1.6rem); }
   .daypart { color: var(--muted); font-size: .95rem; margin-top: .35rem; }
 
   .disc {
@@ -36,9 +35,10 @@
     display: grid; place-items: center; font-family: var(--display); font-weight: 800;
     font-size: clamp(1.4rem, 6vw, 2rem);
     box-shadow: 0 0 0 10px color-mix(in srgb, var(--accent) 22%, transparent);
-    transition: transform .15s, box-shadow .3s;
+    transition: transform .15s, box-shadow .3s, opacity .3s;
   }
-  .disc:active { transform: scale(.97); }
+  .disc:disabled { opacity: .45; cursor: default; }
+  .disc:active:not(:disabled) { transform: scale(.97); }
   .disc:focus-visible { outline: 3px solid var(--ink); outline-offset: 6px; }
   .playing .disc { box-shadow: 0 0 0 10px color-mix(in srgb, var(--accent) 22%, transparent), 0 0 0 26px color-mix(in srgb, var(--accent) 10%, transparent); }
 
@@ -70,13 +70,13 @@
     <div class="daypart" id="daypart"></div>
   </header>
 
-  <button class="disc" id="toggle" aria-label="Play radio">
+  <button class="disc" id="toggle" aria-label="Play radio" disabled>
     <span class="label" id="label">Play</span>
     <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
   </button>
 
   <section class="now" aria-live="polite">
-    <div class="title" id="title">Ready when you are</div>
+    <div class="title" id="title">Loading the playlist…</div>
     <div class="artist" id="artist"></div>
     <div class="status" id="status"></div>
   </section>
@@ -86,38 +86,32 @@
     <input type="range" id="volume" min="0" max="1" step="0.01" value="0.8" aria-label="Volume">
   </label>
 
-  <audio id="audio" preload="none"></audio>
+  <audio id="audio" preload="auto"></audio>
 
 <script>
 /* ============ EDIT THESE ============ */
 const CONFIG = {
   stationName: "Night Shift Radio",
-  // Your Icecast / AzuraCast stream URL (use https so it works on an https GitHub Pages site)
-  streamUrl: "https://YOUR-SERVER/listen/YOUR-STATION/radio.mp3",
-  // AzuraCast now-playing endpoint (leave "" to skip track info)
-  nowPlayingUrl: "https://YOUR-SERVER/api/nowplaying/YOUR-STATION",
-  refreshSeconds: 15,
-  // Hours (0-23) when each colour theme starts
-  dayStart: 11, peakStart: 18, lateStart: 1
+  playlistUrl: "playlist.json",   // list of file names inside the music folder
+  musicFolder: "music/",
+  shuffle: true,                  // reshuffles each time the whole playlist has played
+  epoch: Date.UTC(2026, 0, 1),    // shared start time: everyone hears the same moment
+  dayStart: 11, peakStart: 18, lateStart: 1   // colour themes by hour (0-23)
 };
 /* ==================================== */
 
 const $ = id => document.getElementById(id);
 const audio = $("audio"), toggle = $("toggle");
-const params = new URLSearchParams(location.search);
-if (params.has("kiosk")) document.body.classList.add("kiosk");  // add ?kiosk=1 for a bar screen
+if (new URLSearchParams(location.search).has("kiosk")) document.body.classList.add("kiosk");
 $("stationName").textContent = CONFIG.stationName;
 document.title = CONFIG.stationName;
 
-/* Daypart theme */
-function daypart() {
-  const h = new Date().getHours(), c = CONFIG;
-  if (h >= c.peakStart || h < c.lateStart) return ["peak", "Peak hour"];
-  if (h >= c.lateStart && h < c.dayStart) return ["late", "Late night"];
-  return ["day", "Daytime"];
-}
+/* Colour theme by time of day */
 function applyDaypart() {
-  const [key, name] = daypart();
+  const h = new Date().getHours(), c = CONFIG;
+  let key = "day", name = "Daytime";
+  if (h >= c.peakStart || h < c.lateStart) { key = "peak"; name = "Peak hour"; }
+  else if (h < c.dayStart) { key = "late"; name = "Late night"; }
   document.body.dataset.daypart = key;
   $("daypart").textContent = name;
 }
@@ -131,88 +125,145 @@ $("volume").addEventListener("input", e => {
   try { localStorage.setItem("vol", e.target.value); } catch {}
 });
 
-/* Playback */
-let wantPlaying = false, retryTimer = null, wakeLock = null;
+/* ---------- Playlist loading ---------- */
+let tracks = [];   // {file, title, artist, dur}
+
+function parseName(file) {
+  const base = file.replace(/\.[^.]+$/, "");
+  const i = base.indexOf(" - ");
+  return i > 0 ? { artist: base.slice(0, i).trim(), title: base.slice(i + 3).trim() }
+               : { artist: "", title: base.trim() };
+}
+function trackUrl(file) { return CONFIG.musicFolder + encodeURIComponent(file); }
+
+function getDuration(file) {
+  const key = "dur:" + file;
+  try { const c = parseFloat(localStorage.getItem(key)); if (c > 0) return Promise.resolve(c); } catch {}
+  return new Promise(resolve => {
+    const a = new Audio();
+    const done = d => { a.src = ""; resolve(d); };
+    a.preload = "metadata";
+    a.onloadedmetadata = () => {
+      const d = a.duration;
+      if (isFinite(d) && d > 0) { try { localStorage.setItem(key, d); } catch {} done(d); } else done(0);
+    };
+    a.onerror = () => done(0);
+    setTimeout(() => done(0), 15000);
+    a.src = trackUrl(file);
+  });
+}
+
+async function loadPlaylist() {
+  try {
+    const r = await fetch(CONFIG.playlistUrl, { cache: "no-cache" });
+    const j = await r.json();
+    const files = (Array.isArray(j) ? j : j.tracks || []).filter(Boolean);
+    if (!files.length) throw new Error("empty");
+    const out = [];
+    for (let i = 0; i < files.length; i += 4) {          // 4 at a time
+      const batch = files.slice(i, i + 4);
+      const durs = await Promise.all(batch.map(getDuration));
+      batch.forEach((f, k) => { if (durs[k] > 0) out.push({ file: f, ...parseName(f), dur: durs[k] }); });
+      $("title").textContent = "Loading the playlist… " + Math.min(i + 4, files.length) + "/" + files.length;
+    }
+    if (!out.length) throw new Error("nothing playable");
+    tracks = out;
+    $("title").textContent = "Ready when you are";
+    toggle.disabled = false;
+  } catch (e) {
+    $("title").textContent = "No music yet";
+    $("status").textContent = "Upload MP3s to the music folder and list them in playlist.json.";
+  }
+}
+loadPlaylist();
+
+/* ---------- Radio schedule (same song at the same moment for everyone) ---------- */
+function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function orderFor(cycle) {
+  const list = tracks.slice();
+  if (!CONFIG.shuffle) return list;
+  const rnd = mulberry32(cycle + 1);
+  for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; }
+  return list;
+}
+function slotAt(ms) {
+  const total = tracks.reduce((s, t) => s + t.dur, 0);
+  const elapsed = Math.max(0, (ms - CONFIG.epoch) / 1000);
+  const cycle = Math.floor(elapsed / total);
+  let pos = elapsed - cycle * total;
+  for (const t of orderFor(cycle)) {
+    if (pos < t.dur) return { track: t, offset: pos, remaining: t.dur - pos };
+    pos -= t.dur;
+  }
+  const t = tracks[0]; return { track: t, offset: 0, remaining: t.dur };
+}
+
+/* ---------- Playback ---------- */
+let wantPlaying = false, current = null, wakeLock = null;
 
 function setUI(playing) {
   document.body.classList.toggle("playing", playing);
   $("label").textContent = playing ? "" : "Play";
   toggle.setAttribute("aria-label", playing ? "Pause radio" : "Play radio");
 }
-function setStatus(t) { $("status").textContent = t || ""; }
-
-async function start() {
-  wantPlaying = true;
-  clearTimeout(retryTimer);
-  setStatus("Connecting…");
-  // Reload the stream each time so it's live, not buffered from the past
-  audio.src = CONFIG.streamUrl + (CONFIG.streamUrl.includes("?") ? "&" : "?") + "t=" + Date.now();
-  try {
-    await audio.play();
-    setUI(true); setStatus("");
-    requestWake();
-    updateMediaSession();
-    fetchNow();
-  } catch (e) {
-    setUI(false);
-    setStatus("Couldn't start the stream. Tap Play to try again.");
-    wantPlaying = false;
+function showTrack(t) {
+  current = t;
+  $("title").textContent = t.title;
+  $("artist").textContent = t.artist;
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({ title: t.title, artist: t.artist || CONFIG.stationName });
+    navigator.mediaSession.setActionHandler("play", start);
+    navigator.mediaSession.setActionHandler("pause", stop);
   }
 }
+
+function tuneIn() {
+  let slot = slotAt(Date.now());
+  // If we just finished a track and the clock hasn't ticked over yet, jump to the next one
+  if (current && slot.track.file === current.file && slot.remaining < 2)
+    slot = slotAt(Date.now() + slot.remaining * 1000 + 100);
+  const off = Math.floor(slot.offset);
+  audio.src = trackUrl(slot.track.file) + "#t=" + off;
+  audio.play().then(() => {
+    setUI(true); $("status").textContent = "";
+    if (Math.abs(audio.currentTime - slot.offset) > 3) { try { audio.currentTime = slot.offset; } catch {} }
+  }).catch(() => {
+    setUI(false); wantPlaying = false;
+    $("status").textContent = "Tap Play to start.";
+  });
+  showTrack(slot.track);
+}
+
+function start() { if (!tracks.length) return; wantPlaying = true; tuneIn(); requestWake(); }
 function stop() {
   wantPlaying = false;
-  clearTimeout(retryTimer);
   audio.pause(); audio.removeAttribute("src"); audio.load();
-  setUI(false); setStatus("");
-  releaseWake();
+  setUI(false); releaseWake();
 }
 toggle.addEventListener("click", () => wantPlaying ? stop() : start());
 
-/* Auto-reconnect if the stream drops */
-function scheduleRetry() {
+/* Next song, or skip a broken file */
+audio.addEventListener("ended", () => { if (wantPlaying) tuneIn(); });
+audio.addEventListener("error", () => {
   if (!wantPlaying) return;
-  setUI(false); setStatus("Connection lost. Reconnecting…");
-  clearTimeout(retryTimer);
-  retryTimer = setTimeout(start, 4000);
-}
-audio.addEventListener("error", scheduleRetry);
-audio.addEventListener("stalled", () => { if (wantPlaying) setTimeout(() => { if (audio.readyState < 3) scheduleRetry(); }, 8000); });
-audio.addEventListener("ended", scheduleRetry);
+  $("status").textContent = "Skipping a track that won't play…";
+  setTimeout(() => { if (wantPlaying) { if (current) { tracks = tracks.filter(t => t.file !== current.file); } if (tracks.length) tuneIn(); else stop(); } }, 800);
+});
 
-/* Keep the screen on for bar tablets while playing */
-async function requestWake() {
-  try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch {}
+/* Re-sync if the phone slept or playback drifted */
+function checkDrift() {
+  if (!wantPlaying || !current || audio.paused) return;
+  const slot = slotAt(Date.now());
+  if (slot.track.file !== current.file || Math.abs(audio.currentTime - slot.offset) > 4) tuneIn();
 }
+setInterval(checkDrift, 30000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && wantPlaying) { requestWake(); checkDrift(); }
+});
+
+/* Keep the screen on for bar tablets */
+async function requestWake() { try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch {} }
 function releaseWake() { try { wakeLock?.release(); } catch {} wakeLock = null; }
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && wantPlaying) requestWake(); });
-
-/* Now playing */
-let current = { title: "", artist: "", art: "" };
-async function fetchNow() {
-  if (!CONFIG.nowPlayingUrl || CONFIG.nowPlayingUrl.includes("YOUR-SERVER")) return;
-  try {
-    const r = await fetch(CONFIG.nowPlayingUrl, { cache: "no-store" });
-    const j = await r.json();
-    const s = j.now_playing?.song || {};
-    current = { title: s.title || CONFIG.stationName, artist: s.artist || "", art: s.art || "" };
-    $("title").textContent = current.title;
-    $("artist").textContent = current.artist;
-    updateMediaSession();
-  } catch { /* keep last known track */ }
-}
-setInterval(() => { if (wantPlaying) fetchNow(); }, CONFIG.refreshSeconds * 1000);
-
-/* Lock-screen / headset controls */
-function updateMediaSession() {
-  if (!("mediaSession" in navigator)) return;
-  navigator.mediaSession.metadata = new MediaMetadata({
-    title: current.title || CONFIG.stationName,
-    artist: current.artist || CONFIG.stationName,
-    artwork: current.art ? [{ src: current.art }] : []
-  });
-  navigator.mediaSession.setActionHandler("play", start);
-  navigator.mediaSession.setActionHandler("pause", stop);
-}
 </script>
 </body>
 </html>
